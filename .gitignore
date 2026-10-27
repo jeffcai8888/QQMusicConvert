@@ -1,0 +1,26 @@
+# 版权内容与转换产物 (不入库)
+*.mflac*
+*.mgg*
+*.qmc*
+*.bkc*
+*.flac
+*.mp3
+*.ogg
+*.m4a
+*.wav
+
+# 本机运行时状态 (含登录相关的 ekey 缓存, 切勿提交)
+ekey_cache.json
+gui_config.json
+smoke_result.txt
+
+# 构建产物 (exe 通过 GitHub Releases 分发)
+build/
+dist/
+*.spec
+*.exe
+__pycache__/
+*.pyc
+
+# 第三方参考资料 (仅本地备查, 版权归原作者)
+_ref/
