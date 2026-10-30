@@ -11,7 +11,7 @@ if errorlevel 1 (
 )
 
 if "%~1"=="" (
-  echo 用法: 把 .mflac / .mgg / .qmc 文件或文件夹拖到本脚本上即可转换。
+  echo 用法: 把 .ogg / .flac / .mflac / .mgg / .qmc 文件或文件夹拖到本脚本上即可转换。
   echo 或直接输入路径:
   set /p INPUT=路径:
   if "%INPUT%"=="" pause & exit /b 0

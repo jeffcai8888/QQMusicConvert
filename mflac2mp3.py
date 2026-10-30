@@ -4,6 +4,7 @@
 mflac2mp3.py — QQ 音乐加密音频转 MP3 工具（单文件、无第三方依赖）
 
 支持格式:
+  - 普通 OGG / FLAC 音频 (直接转码, 无需 QQ 音乐登录)
   - QMCv1 静态加密 (.qmc0/.qmc3/.bkcmp3/.bkcflac 等, 旧文件)
   - QMCv2 内嵌 ekey (.mflac/.mgg 带 QTag 或 ekey 尾部, 旧版客户端下载)
   - QMCv2 musicex 尾部 (新版 PC 客户端 >= 19.57 下载, 文件内无 ekey,
@@ -785,6 +786,61 @@ def sniff_audio(head: bytes) -> str | None:
     return None
 
 
+def _read_vorbis_comments(body) -> dict[str, str]:
+    """读取 FLAC / OGG 共用的 Vorbis comment 数据, 忽略不完整的标签。"""
+    tags: dict[str, str] = {}
+    if len(body) < 4:
+        return tags
+    pos = 4 + int.from_bytes(body[:4], "little")
+    if pos + 4 > len(body):
+        return tags
+    count = int.from_bytes(body[pos:pos + 4], "little")
+    pos += 4
+    for _ in range(count):
+        if pos + 4 > len(body):
+            break
+        length = int.from_bytes(body[pos:pos + 4], "little")
+        pos += 4
+        if pos + length > len(body):
+            break
+        comment = bytes(body[pos:pos + length]).decode("utf-8", "replace")
+        key, sep, value = comment.partition("=")
+        if key and sep:
+            tags[key.upper()] = value
+        pos += length
+    return tags
+
+
+def ogg_read_tags(audio) -> dict[str, str]:
+    """读取 Ogg Vorbis / Opus 标签, 支持跨页的 comment packet。"""
+    pos = 0
+    packets: dict[int, bytearray] = {}
+    while pos + 27 <= len(audio):
+        if bytes(audio[pos:pos + 4]) != b"OggS" or audio[pos + 4] != 0:
+            break
+        segment_count = audio[pos + 26]
+        body_pos = pos + 27 + segment_count
+        if body_pos > len(audio):
+            break
+        segments = audio[pos + 27:body_pos]
+        page_end = body_pos + sum(segments)
+        if page_end > len(audio):
+            break
+        serial = int.from_bytes(audio[pos + 14:pos + 18], "little")
+        packet = packets.setdefault(serial, bytearray())
+        for length in segments:
+            packet.extend(audio[body_pos:body_pos + length])
+            body_pos += length
+            if length < 255:
+                if packet.startswith(b"\x03vorbis"):
+                    return _read_vorbis_comments(packet[7:])
+                if packet.startswith(b"OpusTags"):
+                    return _read_vorbis_comments(packet[8:])
+                packet.clear()
+        pos = page_end
+    return {}
+
+
 def flac_read_tags(audio) -> dict[str, str]:
     """读取 FLAC VORBIS_COMMENT 标签 (返回大写 key -> value)。"""
     tags: dict[str, str] = {}
@@ -798,17 +854,7 @@ def flac_read_tags(audio) -> dict[str, str]:
             blen = int.from_bytes(bytes(audio[pos + 1:pos + 4]), "big")
             body = bytes(audio[pos + 4:pos + 4 + blen])
             if btype == 4:  # VORBIS_COMMENT
-                vlen = int.from_bytes(body[0:4], "little")
-                p = 4 + vlen
-                count = int.from_bytes(body[p:p + 4], "little")
-                p += 4
-                for _ in range(count):
-                    clen = int.from_bytes(body[p:p + 4], "little")
-                    comment = body[p + 4:p + 4 + clen].decode("utf-8", "replace")
-                    if "=" in comment:
-                        k, _, v = comment.partition("=")
-                        tags[k.upper()] = v
-                    p += 4 + clen
+                tags = _read_vorbis_comments(body)
                 break
             if last:
                 break
@@ -867,7 +913,8 @@ def flac_duration_seconds(audio) -> float | None:
 
 def run_ffmpeg(ffmpeg: str, src: Path, dst: Path, bitrate: int, vbr: bool,
                tags: dict[str, str] | None = None, total_seconds: float | None = None,
-               progress=None, cancel_event: threading.Event | None = None) -> None:
+               progress=None, cancel_event: threading.Event | None = None,
+               metadata_from_audio: bool = False) -> None:
     cmd = [ffmpeg, "-y", "-hide_banner", "-nostats", "-loglevel", "error",
            "-progress", "pipe:1", "-i", str(src),
            "-map", "0:a", "-map", "0:v?",
@@ -876,12 +923,18 @@ def run_ffmpeg(ffmpeg: str, src: Path, dst: Path, bitrate: int, vbr: bool,
         cmd += ["-q:a", "0"]
     else:
         cmd += ["-b:a", f"{bitrate}k"]
+    if metadata_from_audio:
+        # OGG 的 Vorbis comments 位于音轨, 需显式映射到 MP3 的全局 ID3 标签。
+        cmd += ["-map_metadata", "0:s:a:0"]
     cmd += ["-c:v", "copy", "-id3v2_version", "3", "-write_id3v1", "1"]
     for k, v in (tags or {}).items():
         cmd += ["-metadata", f"{k}={v}"]
     cmd.append(str(dst))
 
-    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    # Windows GUI 启动 ffmpeg 时不要为每个文件创建控制台窗口。
+    creationflags = subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0
+    proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                            creationflags=creationflags)
     stderr_lines: list[bytes] = []
 
     def drain_stderr():
@@ -1002,38 +1055,46 @@ def convert_one(path: Path, ctx: ConvertContext,
 
     data = bytearray(path.read_bytes())
     _check_cancel(ctx)
-    try:
-        trailer = detect_trailer(data)
-    except UnsupportedFormat as e:
-        return False, f"不支持的文件格式: {e}"
-
-    if trailer.kind == "musicex":
-        _stage("获取 ekey")
-        try:
-            ekey = ctx.resolve_ekey(trailer)
-        except RuntimeError as e:
-            return False, f"获取 ekey 失败: {e}"
-        kind_desc = f"musicex (song_id={trailer.song_id})"
-    elif trailer.ekey:
-        ekey = trailer.ekey
-        kind_desc = trailer.kind
+    ext = sniff_audio(bytes(data[:16]))
+    is_plain = ext in ("ogg", "flac")
+    if is_plain:
+        audio = memoryview(data)
+        kind_desc = ext.upper()
     else:
-        ekey = None
-        kind_desc = "static(v1)"
+        if path.suffix.lower() in (".ogg", ".flac"):
+            return False, "不是有效的 OGG/FLAC 音频, 请检查文件是否损坏或仍处于加密状态"
+        try:
+            trailer = detect_trailer(data)
+        except UnsupportedFormat as e:
+            return False, f"不支持的文件格式: {e}"
 
-    _stage("解密中")
-    try:
-        cipher = make_cipher(ekey)
-    except ValueError as e:
-        return False, f"密钥无效: {e}"
+        if trailer.kind == "musicex":
+            _stage("获取 ekey")
+            try:
+                ekey = ctx.resolve_ekey(trailer)
+            except RuntimeError as e:
+                return False, f"获取 ekey 失败: {e}"
+            kind_desc = f"musicex (song_id={trailer.song_id})"
+        elif trailer.ekey:
+            ekey = trailer.ekey
+            kind_desc = trailer.kind
+        else:
+            ekey = None
+            kind_desc = "static(v1)"
 
-    audio = memoryview(data)[:trailer.audio_size]
-    cipher.decrypt(audio)
-    _check_cancel(ctx)
-    ext = sniff_audio(bytes(audio[:16]))
-    if ext is None:
-        head = bytes(audio[:8]).hex()
-        return False, f"解密结果不是有效音频 (头部 {head}), 密钥可能错误或格式不受支持"
+        _stage("解密中")
+        try:
+            cipher = make_cipher(ekey)
+        except ValueError as e:
+            return False, f"密钥无效: {e}"
+
+        audio = memoryview(data)[:trailer.audio_size]
+        cipher.decrypt(audio)
+        _check_cancel(ctx)
+        ext = sniff_audio(bytes(audio[:16]))
+        if ext is None:
+            head = bytes(audio[:8]).hex()
+            return False, f"解密结果不是有效音频 (头部 {head}), 密钥可能错误或格式不受支持"
     if progress:
         progress(0.2)
 
@@ -1043,6 +1104,10 @@ def convert_one(path: Path, ctx: ConvertContext,
     dec_path = out_dir / f"{stem}.{ext}"
 
     if ctx.flac_only:
+        if is_plain:
+            if progress:
+                progress(1.0)
+            return True, f"[{kind_desc}] 无需解密, 已跳过: {path.name}"
         if dec_path.exists() and not ctx.overwrite:
             return True, f"已存在, 跳过: {dec_path.name}"
         dec_path.write_bytes(audio)
@@ -1054,7 +1119,10 @@ def convert_one(path: Path, ctx: ConvertContext,
     if mp3_path.exists() and not ctx.overwrite:
         return True, f"已存在, 跳过: {mp3_path.name}"
 
-    if ctx.keep_audio:
+    if is_plain:
+        # 普通音频直接作为转码输入, 不写回或清理源文件。
+        tmp_dec = path
+    elif ctx.keep_audio:
         dec_path.write_bytes(audio)
         tmp_dec = dec_path
     else:
@@ -1063,6 +1131,8 @@ def convert_one(path: Path, ctx: ConvertContext,
 
     try:
         if not ctx.ffmpeg:
+            if is_plain:
+                return False, "未找到 ffmpeg, 无法转 MP3 (请安装 ffmpeg 或手动指定路径)"
             if not ctx.keep_audio:
                 dec_path.write_bytes(audio)
                 tmp_dec.unlink(missing_ok=True)
@@ -1070,15 +1140,15 @@ def convert_one(path: Path, ctx: ConvertContext,
         _stage("转码 MP3")
         tags = None
         if ext in ("flac", "ogg"):
-            existing = flac_read_tags(audio)
+            existing = ogg_read_tags(audio) if ext == "ogg" else flac_read_tags(audio)
             guessed = guess_tags_from_filename(stem)
             tags = {k: v for k, v in guessed.items() if k.upper() not in existing}
         total = flac_duration_seconds(audio) if ext == "flac" else None
         run_ffmpeg(ctx.ffmpeg, tmp_dec, mp3_path, ctx.bitrate, ctx.vbr, tags,
                    total_seconds=total, progress=progress,
-                   cancel_event=ctx.cancel_event)
+                   cancel_event=ctx.cancel_event, metadata_from_audio=(ext == "ogg"))
     finally:
-        if not ctx.keep_audio:
+        if not is_plain and not ctx.keep_audio:
             tmp_dec.unlink(missing_ok=True)
 
     if progress:
@@ -1088,6 +1158,7 @@ def convert_one(path: Path, ctx: ConvertContext,
 
 
 SUPPORTED_EXTS = {
+    ".ogg", ".flac",
     ".mflac", ".mflac0", ".mflac1", ".mflac2", ".mflach",
     ".mgg", ".mgg0", ".mgg1", ".mggl", ".mggh",
     ".qmcflac", ".qmcogg", ".qmc0", ".qmc2", ".qmc3",
@@ -1100,7 +1171,8 @@ def collect_inputs(inputs: list[str]) -> list[Path]:
     for item in inputs:
         p = Path(item)
         if p.is_dir():
-            files.extend(sorted(q for q in p.rglob("*") if q.suffix.lower() in SUPPORTED_EXTS))
+            files.extend(sorted(q for q in p.rglob("*")
+                                if q.suffix.lower() in SUPPORTED_EXTS and q.is_file()))
         elif p.is_file():
             files.append(p)
         else:
@@ -1217,7 +1289,7 @@ def main(argv=None) -> int:
 
     ap = argparse.ArgumentParser(
         prog="mflac2mp3",
-        description="QQ 音乐加密音频 (.mflac/.mgg/.qmc*) 转 MP3 工具",
+        description="OGG / FLAC / QQ 音乐加密音频 (.mflac/.mgg/.qmc*) 转 MP3 工具",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
   python mflac2mp3.py "周杰伦 - 搁浅.mflac"
@@ -1226,6 +1298,7 @@ def main(argv=None) -> int:
   python mflac2mp3.py --self-test
 
 说明:
+  - 普通 OGG / FLAC 文件直接转 MP3, 无需解密或登录 QQ 音乐。
   - 旧版文件 (尾部内嵌 ekey / QMCv1) 完全离线解密。
   - 新版 musicex 文件需要本机 QQ 音乐客户端正在运行且已登录,
     工具会自动提取登录凭据并调用官方接口获取该文件的解密密钥。
@@ -1234,7 +1307,7 @@ def main(argv=None) -> int:
     ap.add_argument("-o", "--output-dir", help="输出目录 (默认与输入文件同目录)")
     ap.add_argument("-b", "--bitrate", type=int, default=320, help="MP3 码率 kbps, 默认 320")
     ap.add_argument("--vbr", action="store_true", help="使用 VBR (lame -q:a 0) 代替 CBR")
-    ap.add_argument("--keep-flac", action="store_true", help="保留解密后的无损文件")
+    ap.add_argument("--keep-flac", action="store_true", help="保留解密后的原格式音频 (FLAC/OGG 等)")
     ap.add_argument("--flac-only", action="store_true", help="只解密, 不转 MP3")
     ap.add_argument("-y", "--overwrite", action="store_true", help="覆盖已存在的输出文件")
     ap.add_argument("--ffmpeg", help="ffmpeg 可执行文件路径")

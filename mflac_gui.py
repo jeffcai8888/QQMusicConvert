@@ -27,9 +27,9 @@ import tkinter as tk
 
 import mflac2mp3 as M
 
-APP_TITLE = "mflac2mp3 — QQ 音乐加密音频转 MP3"
+APP_TITLE = "mflac2mp3 — OGG / FLAC / QQ 音乐转 MP3"
 CONFIG_NAME = "gui_config.json"
-SUPPORTED_DESC = "QQ 音乐加密音频 (mflac/mgg/qmc 系列)"
+SUPPORTED_DESC = "音频文件 (ogg/flac/mflac/mgg/qmc 系列)"
 BITRATE_CHOICES = ("320", "256", "224", "192", "128", "VBR (最高音质)")
 
 
@@ -126,7 +126,7 @@ class GuiApp:
         row2 = ttk.Frame(opt)
         row2.pack(fill="x", padx=8, pady=(2, 6))
         self.var_keep_flac = tk.BooleanVar(value=False)
-        self.chk_keep_flac = ttk.Checkbutton(row2, text="保留解密的无损文件",
+        self.chk_keep_flac = ttk.Checkbutton(row2, text="保留解密的原格式音频",
                                              variable=self.var_keep_flac)
         self.chk_keep_flac.pack(side="left", padx=(0, 16))
         self.var_overwrite = tk.BooleanVar(value=False)
@@ -233,7 +233,9 @@ class GuiApp:
 
     def add_files(self):
         paths = filedialog.askopenfilenames(
-            title="选择加密音频文件", filetypes=[(SUPPORTED_DESC, "*.mflac *.mflac0 *.mflac1 *.mflac2 *.mflach *.mgg *.mgg0 *.mgg1 *.mggl *.mggh *.qmcflac *.qmcogg *.qmc0 *.qmc2 *.qmc3 *.bkcmp3 *.bkcflac"), ("所有文件", "*.*")])
+            title="选择音频文件",
+            filetypes=[(SUPPORTED_DESC, " ".join("*" + ext for ext in sorted(M.SUPPORTED_EXTS))),
+                       ("所有文件", "*.*")])
         self._append_files([Path(p) for p in paths])
 
     def add_folder(self):
@@ -346,6 +348,7 @@ class GuiApp:
     def _worker(self, ctx: M.ConvertContext, files: list[Path]):
         ok_count = fail_count = 0
         cancelled = False
+        output_dirs: set[Path] = set()
         try:
             for i, path in enumerate(files):
                 if self.cancel_event.is_set():
@@ -365,6 +368,8 @@ class GuiApp:
                     self.q.put(("result", i, ok, msg))
                     ok_count += 1 if ok else 0
                     fail_count += 0 if ok else 1
+                    if ok:
+                        output_dirs.add((ctx.out_dir or path.parent).resolve())
                 except M.OperationCancelled:
                     self.q.put(("result", i, False, "已取消"))
                     fail_count += 1
@@ -374,7 +379,7 @@ class GuiApp:
                     self.q.put(("result", i, False, f"异常: {e}"))
                     fail_count += 1
         finally:
-            self.q.put(("done", ok_count, fail_count, cancelled))
+            self.q.put(("done", ok_count, fail_count, cancelled, sorted(output_dirs)))
 
     # ---------------------------------------------------- 队列轮询
 
@@ -403,13 +408,20 @@ class GuiApp:
                     _, i, ok, msg = event
                     self._set_row(i, status=("✓ " if ok else "✗ ") + msg)
                 elif kind == "done":
-                    _, ok_count, fail_count, cancelled = event
+                    _, ok_count, fail_count, cancelled, output_dirs = event
+                    cancelled = cancelled or self.cancel_event.is_set()
                     self.progress.configure(value=100 if not cancelled else self.progress["value"])
                     summary = (f"{'已取消 ' if cancelled else ''}完成: 成功 {ok_count}, 失败 {fail_count}")
                     self.lbl_summary.configure(text=summary)
                     self.lbl_stage.configure(text="就绪")
                     self._set_running(False)
                     self._refresh_ffmpeg_status()
+                    if not cancelled:
+                        for folder in output_dirs:
+                            try:
+                                os.startfile(str(folder))
+                            except OSError:
+                                self.lbl_stage.configure(text=f"无法自动打开输出目录: {folder}")
         except queue.Empty:
             pass
         if self.root.winfo_exists():

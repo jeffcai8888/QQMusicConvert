@@ -1,7 +1,8 @@
-# mflac2mp3 — QQ 音乐加密音频转 MP3 工具
+# mflac2mp3 — OGG / FLAC / QQ 音乐转 MP3 工具
 
 将 QQ 音乐下载的加密音频（`.mflac` / `.mgg` / `.qmcflac` / `.qmc0` 等）解密并转换为
 MP3（默认 320kbps CBR，保留标签与封面，`歌手 - 歌名` 文件名自动补写 ID3 标签）。
+也支持普通 `.ogg` / `.flac` 直接转 MP3，无需 QQ 音乐登录或联网。
 
 提供 **图形界面（mflac2mp3.exe）** 与 **命令行（mflac2mp3.py）** 两种使用方式；
 纯标准库实现，转码依赖 [ffmpeg](https://ffmpeg.org)。
@@ -15,16 +16,22 @@ MP3（默认 320kbps CBR，保留标签与封面，`歌手 - 歌名` 文件名�
 
 双击 `mflac2mp3.exe`（或 `python mflac_gui.py`）：
 
-1. **添加文件 / 添加文件夹**：批量导入待转换的加密音频（也可把文件拖到 exe 图标上，启动后自动进列表）；
+1. **添加文件 / 添加文件夹**：批量导入 OGG、FLAC 或 QQ 音乐加密音频（也可把文件拖到 exe 图标上，启动后自动进列表）；
 2. 选择码率（默认 320k，或 VBR 最高音质）、输出目录（默认原目录）；
-3. 点 **开始转换**——列表逐行显示进度与结果，底部有总进度条，可随时**取消**；
-4. 选项（码率/输出目录/保留无损等）会自动记忆，下次打开保持。
+3. 点 **开始转换**——列表逐行显示进度与结果，底部有总进度条，可随时**取消**；批量结束后自动打开成功文件的输出目录（每个目录只打开一次，取消或全部失败时不打开）；
+4. 选项（码率/输出目录/保留原格式音频等）会自动记忆，下次打开保持。
 
 ### 命令行
 
 ```bash
 # 转换单个文件
 python mflac2mp3.py "周杰伦 - 搁浅.mflac"
+
+# 转换 MGG，保留原曲名、歌手、专辑等标签
+python mflac2mp3.py "陶喆 - 普通朋友 (Live)_L.mgg"
+
+# 普通 OGG / FLAC 直接转换（支持混合批量导入）
+python mflac2mp3.py "歌手 - 歌曲.ogg" "歌手 - 另一首.flac"
 
 # 转换整个目录（递归），输出到指定目录
 python mflac2mp3.py "D:\VipSongsDownload" -o "D:\MP3"
@@ -37,6 +44,14 @@ python mflac2mp3.py --self-test
 ```
 
 也可以把文件/文件夹**直接拖到 `convert.bat` 上**（Windows）。
+
+MGG 通常解密为 OGG 音频，再由 ffmpeg 转成 MP3；文件选择、文件夹批量导入和拖放启动
+均支持 `.mgg`（也支持 `.mgg0/.mgg1/.mggl/.mggh`）。转换时优先保留音频内的标签，
+缺少歌手或曲名时才从文件名补写。`--keep-flac` 同样适用于 MGG，会保留解密出的 `.ogg`；
+`--flac-only` 则只解密为原格式。OGG 通常是有损音频，转换成 320kbps MP3 不会提升原始音质。
+
+普通 OGG / FLAC 的源文件始终保留，直接作为转码输入；“保留解密的原格式音频”选项
+仅作用于加密文件。勾选“只解密不转 MP3”（`--flac-only`）时，普通音频会显示“无需解密”并跳过。
 
 ## 支持的加密格式
 
@@ -66,7 +81,7 @@ python mflac2mp3.py <文件或目录...> [选项]
   -o, --output-dir DIR   输出目录（默认与输入文件同目录）
   -b, --bitrate K        MP3 码率，默认 320
   --vbr                  使用 VBR（lame -q:a 0）代替 CBR
-  --keep-flac            保留解密后的无损文件
+  --keep-flac            保留解密后的原格式音频（FLAC/OGG 等）
   --flac-only            只解密，不转 MP3
   -y, --overwrite        覆盖已存在的输出文件（默认跳过）
   --ffmpeg PATH          ffmpeg 可执行文件路径
@@ -94,6 +109,16 @@ pip install pyinstaller
 python -m PyInstaller --noconfirm --clean --onefile --windowed --name mflac2mp3 mflac_gui.py
 # 产物在 dist/mflac2mp3.exe
 ```
+
+### 回归测试
+
+```bash
+python -m unittest discover -s tests -v
+```
+
+测试使用合成音频，无需 QQ 音乐登录或真实歌曲。需安装 ffmpeg 和 ffprobe；覆盖 MGG 的
+静态加密、内嵌 ekey、QTag、Map/RC4 路径，以及跨页 OGG 标签、缺失标签补写、普通
+OGG/FLAC 转换、源文件保留和混合目录导入。
 
 ## 原理
 
